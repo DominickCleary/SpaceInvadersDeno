@@ -2,8 +2,8 @@ use bevy::{
     prelude::*,
     window::{Window, WindowResolution, ExitCondition},
 };
-use bevy::math::bounding::{Aabb2d, BoundingVolume, IntersectsVolume};
-use bevy::render::render_resource::Texture;
+use std::time::Duration;
+use rand::prelude::*;
 
 const RESOLUTION: Vec2 = Vec2::new(720., 720.);
 const TURRET_BASE_SIZE: Vec2 = Vec2::new(26., 16.);
@@ -31,6 +31,8 @@ const GAP_BETWEEN_INVADERS: f32 = 10.;
 const INVADER_STEP_SIZE: f32 = 26.0;
 const INVADER_VERTICAL_STEP: f32 = 26.0;
 const INVADER_MOVE_INTERVAL: f32 = 1.;
+const INVADER_SHOOT_INTERVAL: f32 = 2.0;
+const INVADER_BULLET_SIZE: Vec2 = Vec2::new(4.0, 10.0);
 
 fn main() {
     App::new()
@@ -45,18 +47,35 @@ fn main() {
             })
             .set(ImagePlugin::default_nearest()))
         .add_systems(Startup, setup)
-        .add_systems(Update, (move_turret, shoot_bullet))
-        .add_systems(FixedUpdate, ((check_for_collisions, move_bullet).chain(), move_invaders, animate_invaders))
+        .add_systems(Update, (move_turret, shoot_bullet, invader_shoot))
+        .add_systems(
+            FixedUpdate,
+            (
+                (check_for_collisions, move_bullet, move_invader_bullet).chain(),
+                move_invaders,
+                animate_invaders,
+            ),
+        )
         .insert_resource(ShootTimer(Timer::from_seconds(SHOOT_COOLDOWN, TimerMode::Once)))
         .insert_resource(InvaderDirection::Right)
-        .insert_resource(InvaderMoveTimer(Timer::from_seconds(INVADER_MOVE_INTERVAL, TimerMode::Repeating)))
-        .insert_resource(AnimationTimer(Timer::from_seconds(INVADER_MOVE_INTERVAL, TimerMode::Repeating)))
+        .insert_resource(InvaderShootTimer(Timer::from_seconds(INVADER_SHOOT_INTERVAL, TimerMode::Repeating)))
+        .insert_resource(InvaderMoveTimer {
+            timer: Timer::from_seconds(INVADER_MOVE_INTERVAL, TimerMode::Repeating),
+            initial_interval: INVADER_MOVE_INTERVAL,
+            minimum_interval: 0.1,
+        })
         .add_event::<CollisionEvent>()
         .run();
 }
 
 #[derive(Resource)]
 struct ShootTimer(Timer);
+
+#[derive(Component)]
+struct InvaderBullet;
+
+#[derive(Resource)]
+struct InvaderShootTimer(Timer);
 
 #[derive(Resource, Debug)]
 enum InvaderDirection {
@@ -65,10 +84,11 @@ enum InvaderDirection {
 }
 
 #[derive(Resource)]
-struct InvaderMoveTimer(Timer);
-
-#[derive(Resource)]
-struct AnimationTimer(Timer);
+struct InvaderMoveTimer {
+    timer: Timer,
+    initial_interval: f32,
+    minimum_interval: f32,
+}
 
 #[derive(Component)]
 struct Turret;
@@ -83,7 +103,11 @@ struct Bullet;
 struct Invader {
     invader_type: InvaderType,
     animation_frame: usize,
-    collider: Collider,
+}
+
+#[derive(Resource)]
+struct InvaderCount {
+    total: usize,
 }
 
 #[derive(Component)]
@@ -115,10 +139,11 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         Turret
     ));
 
-    // let layout = TextureAtlasLayout::add_texture(asset_server.load("sprites/invader_a1.png"));
-
     let n_columns = (((RESOLUTION.x - 2. * TURRET_PADDING) / (INVADER_C_SIZE.x + GAP_BETWEEN_INVADERS)) * INVADER_SCREEN_PERCENTAGE).floor() as usize;
     let n_rows = 5;
+    let total_invaders = n_columns * n_rows;
+
+    commands.insert_resource(InvaderCount { total: total_invaders });
 
     for row in 0..n_rows {
         for column in 0..n_columns {
@@ -152,6 +177,62 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                 },
                 Collider
             ));
+        }
+    }
+}
+
+fn invader_shoot(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut shoot_timer: ResMut<InvaderShootTimer>,
+    invader_query: Query<&Transform, With<Invader>>,
+    asset_server: Res<AssetServer>,
+) {
+    shoot_timer.0.tick(time.delta());
+
+    if shoot_timer.0.finished() {
+        // Randomly select invaders to shoot
+        let invaders: Vec<_> = invader_query.iter().collect();
+        if !invaders.is_empty() {
+            // Randomly select an invader
+            let mut rng = rand::thread_rng();
+            let invader_transform = invaders[rng.gen_range(0..invaders.len())];
+
+            // Spawn an invader bullet
+            commands.spawn((
+                SpriteBundle {
+                    texture: asset_server.load("sprites\\invader_bullet.png"),
+                    sprite: Sprite {
+                        custom_size: Some(INVADER_BULLET_SIZE),
+                        ..default()
+                    },
+                    transform: Transform {
+                        translation: Vec3::new(
+                            invader_transform.translation.x,
+                            invader_transform.translation.y - INVADER_BULLET_SIZE.y / 2.0,
+                            1.0,
+                        ),
+                        ..default()
+                    },
+                    ..default()
+                },
+                Collider,
+                InvaderBullet,
+            ));
+        }
+    }
+}
+
+fn move_invader_bullet(
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Transform), With<InvaderBullet>>,
+    time: Res<Time>,
+) {
+    for (entity, mut bullet_transform) in query.iter_mut() {
+        bullet_transform.translation.y -= BULLET_SPEED * time.delta_seconds();
+
+        if bullet_transform.translation.y < -RESOLUTION.y / 2.0 {
+            commands.entity(entity).despawn();
         }
     }
 }
@@ -213,22 +294,30 @@ fn move_bullet(mut commands: Commands, mut query: Query<(Entity, &mut Transform)
     for (entity, mut bullet_transform) in query.iter_mut() {
         bullet_transform.translation.y += BULLET_SPEED * time.delta_seconds();
 
-        if (bullet_transform.translation.y > RESOLUTION.y / 2.) {
-            commands.entity(entity).despawn()
+        if bullet_transform.translation.y > RESOLUTION.y / 2. {
+            commands.entity(entity).despawn();
         }
     }
 }
+
 
 fn move_invaders(
     mut query: Query<&mut Transform, With<Invader>>,
     mut direction: ResMut<InvaderDirection>,
     time: Res<Time>,
     mut move_timer: ResMut<InvaderMoveTimer>,
+    invader_count: Res<InvaderCount>,
 ) {
+    let current_invader_count = query.iter().count() as f32;
+
+    let new_interval = (move_timer.initial_interval * current_invader_count / invader_count.total as f32)
+        .max(move_timer.minimum_interval);
+
+    move_timer.timer.set_duration(Duration::from_secs_f32(new_interval));
+    move_timer.timer.tick(time.delta());
+
     let mut move_down = false;
     let mut new_direction: InvaderDirection = InvaderDirection::Right;
-
-    move_timer.0.tick(time.delta());
 
     let largest_x = query
         .iter()
@@ -240,7 +329,7 @@ fn move_invaders(
         .min_by(|a, b| a.translation.x.partial_cmp(&b.translation.x).unwrap())
         .map(|t| t.translation.x);
 
-    if move_timer.0.finished() {
+    if move_timer.timer.finished() {
         for mut transform in query.iter_mut() {
             if let (Some(largest_x), Some(smallest_x)) = (largest_x, smallest_x) {
                 match *direction {
@@ -276,13 +365,10 @@ fn move_invaders(
 
 fn animate_invaders(
     mut query: Query<(&mut Handle<Image>, &mut Invader)>,
-    mut animation_timer: ResMut<AnimationTimer>,
-    time: Res<Time>,
+    mut animation_timer: Res<InvaderMoveTimer>,
     asset_server: Res<AssetServer>,
 ) {
-    animation_timer.0.tick(time.delta());
-
-    if animation_timer.0.just_finished() {
+    if animation_timer.timer.just_finished() {
         for (mut texture_handle, mut invader) in query.iter_mut() {
             invader.animation_frame = if invader.animation_frame == 1 { 2 } else { 1 };
 
@@ -303,33 +389,88 @@ fn get_invader_sprite_path(invader_type: &InvaderType, frame: usize) -> String {
 
 fn check_for_collisions(
     mut commands: Commands,
-    bullet_query: Query<&Transform, With<Bullet>>,
-    collider_query: Query<(Entity, &Transform, Option<&Invader>), With<Collider>>,
     mut collision_events: EventWriter<CollisionEvent>,
+    // Bullet queries
+    bullet_query: Query<(Entity, &Transform, &Sprite), With<Bullet>>,
+    invader_bullet_query: Query<(Entity, &Transform, &Sprite), With<InvaderBullet>>,
+    // Collider queries
+    collider_query: Query<(Entity, &Transform, &Sprite, Option<&Invader>, Option<&Turret>), With<Collider>>,
 ) {
-    for bullet_transform in bullet_query.iter() {
-        for (collider_entity, collider_transform, maybe_invader) in collider_query.iter() {
-            let bullet_bounding_box = Aabb2d::new(
-                bullet_transform.translation.truncate(),
-                bullet_transform.scale.truncate() / 2.,
-            );
-            let collider_bounding_box = Aabb2d::new(
-                collider_transform.translation.truncate(),
-                collider_transform.scale.truncate() / 2.,
-            );
+    // Handle collisions between player bullets and invaders
+    for (bullet_entity, bullet_transform, bullet_sprite) in bullet_query.iter() {
+        let bullet_size = bullet_sprite.custom_size.unwrap_or(Vec2::new(1.0, 1.0));
+        let bullet_position = bullet_transform.translation.truncate();
+        let bullet_half_size = bullet_size / 2.0;
 
-            let collision = bullet_bounding_box.intersects(&collider_bounding_box);
+        let bullet_min = bullet_position - bullet_half_size;
+        let bullet_max = bullet_position + bullet_half_size;
 
-            if (collision) {
-                println!("{}", collision);
+        for (collider_entity, collider_transform, collider_sprite, maybe_invader, _) in collider_query.iter() {
+            if collider_entity == bullet_entity {
+                continue;
             }
+
+            let collider_size = collider_sprite.custom_size.unwrap_or(Vec2::new(1.0, 1.0));
+            let collider_position = collider_transform.translation.truncate();
+            let collider_half_size = collider_size / 2.0;
+
+            let collider_min = collider_position - collider_half_size;
+            let collider_max = collider_position + collider_half_size;
+
+            let collision = (bullet_min.x <= collider_max.x && bullet_max.x >= collider_min.x)
+                && (bullet_min.y <= collider_max.y && bullet_max.y >= collider_min.y);
 
             if collision {
                 collision_events.send_default();
 
+                commands.entity(bullet_entity).despawn();
+
                 if maybe_invader.is_some() {
                     commands.entity(collider_entity).despawn();
                 }
+
+                break;
+            }
+        }
+    }
+
+    // Handle collisions between invader bullets and the turret
+    for (invader_bullet_entity, bullet_transform, bullet_sprite) in invader_bullet_query.iter() {
+        let bullet_size = bullet_sprite.custom_size.unwrap_or(Vec2::new(1.0, 1.0));
+        let bullet_position = bullet_transform.translation.truncate();
+        let bullet_half_size = bullet_size / 2.0;
+
+        let bullet_min = bullet_position - bullet_half_size;
+        let bullet_max = bullet_position + bullet_half_size;
+
+        for (collider_entity, collider_transform, collider_sprite, _, maybe_turret) in collider_query.iter() {
+            if collider_entity == invader_bullet_entity {
+                continue;
+            }
+
+            if maybe_turret.is_none() {
+                continue;
+            }
+
+            let collider_size = collider_sprite.custom_size.unwrap_or(Vec2::new(1.0, 1.0));
+            let collider_position = collider_transform.translation.truncate();
+            let collider_half_size = collider_size / 2.0;
+
+            let collider_min = collider_position - collider_half_size;
+            let collider_max = collider_position + collider_half_size;
+
+            let collision = (bullet_min.x <= collider_max.x && bullet_max.x >= collider_min.x)
+                && (bullet_min.y <= collider_max.y && bullet_max.y >= collider_min.y);
+
+            if collision {
+                collision_events.send_default();
+
+                commands.entity(invader_bullet_entity).despawn();
+
+                // Handle turret hit (e.g., end game or reduce life)
+                println!("Turret has been hit!");
+
+                break;
             }
         }
     }
